@@ -1,0 +1,79 @@
+name: Build OpenWrt 25.12.5 (116MB NAND Mod) for ASUS RT-AX53U
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Host Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev zlib1g-dev gawk git \
+            gettext libssl-dev xsltproc rsync wget unzip python3 zstd \
+            device-tree-compiler u-boot-tools file
+
+      - name: Download OpenWrt 25.12.5 ImageBuilder
+        run: |
+          wget -q https://downloads.openwrt.org/releases/25.12.5/targets/ramips/mt7621/openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64.tar.zst
+          tar --use-compress-program=unzstd -xf openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64.tar.zst
+
+      - name: Patch DTB (50MB -> 116.125MB) and Rebuild Kernel uImage
+        working-directory: openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64
+        run: |
+          KDIR="build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621"
+          DTB="$KDIR/image-mt7621_asus_rt-ax53u.dtb"
+          KBIN="$KDIR/asus_rt-ax53u-kernel.bin"
+
+          # 1. Декомпиляция штатного DTB в DTS
+          dtc -I dtb -O dts -o ax53u.dts "$DTB"
+
+          # 2. Удаление разделов firmware2 и jffs2, расширение firmware до 0x7420000 (116.125 МБ)
+          python3 - << 'EOF'
+          import re
+          with open("ax53u.dts", "r") as f:
+              dts = f.read()
+
+          dts = re.sub(r'\s*partition@35e0000\s*\{[^}]*\};', '', dts)
+          dts = re.sub(r'\s*partition@67e0000\s*\{[^}]*\};', '', dts)
+          dts, count = re.subn(
+              r'(partition@3e0000\s*\{[^}]*?reg\s*=\s*<)0x3e0000\s+0x3200000(>)',
+              r'\g<1>0x3e0000 0x7420000\g<2>',
+              dts,
+              flags=re.DOTALL
+          )
+          assert count == 1, "Failed to patch partition@3e0000 reg property!"
+          with open("ax53u.dts", "w") as f:
+              f.write(dts)
+          EOF
+
+          # 3. Компиляция модифицированного DTB обратно
+          dtc -I dts -O dtb -o "$DTB" ax53u.dts
+
+          # 4. Пересборка ядра uImage с новым DTB и сохранением заводского vermagic
+          INFO=$(./staging_dir/host/bin/mkimage -l "$KBIN")
+          LOAD_ADDR=$(echo "$INFO" | awk '/Load Address:/ {print $3}')
+          ENTRY_ADDR=$(echo "$INFO" | awk '/Entry Point:/ {print $3}')
+          IMAGE_NAME=$(echo "$INFO" | sed -n 's/^Image Name:[[:space:]]*//p')
+
+          cat "$KDIR/vmlinux" "$DTB" > "$KDIR/vmlinux-ax53u"
+          ./staging_dir/host/bin/lzma e "$KDIR/vmlinux-ax53u" -lc1 -lp2 -pb2 "$KDIR/vmlinux-ax53u.lzma"
+          ./staging_dir/host/bin/mkimage -A mips -O linux -T kernel -C lzma \
+            -a "$LOAD_ADDR" -e "$ENTRY_ADDR" -n "$IMAGE_NAME" \
+            -d "$KDIR/vmlinux-ax53u.lzma" "$KBIN"
+
+          # 5. Увеличение лимита размера образа в профиле сборки
+          sed -i '/define Device\/asus_rt-ax53u/,/endef/s/51200k/118912k/' target/linux/ramips/image/mt7621.mk
+
+      - name: Build Sysupgrade Image with Base Packages
+        working-directory: openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64
+        run: |
+          make image PROFILE="asus_rt-ax53u" \
+            PACKAGES="luci luci-ssl luci-compat curl wget-ssl ca-bundle jq kmod-tun kmod-nft-tproxy kmod-mtd-rw ubi-utils nano"
+
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-25.12.5-ax53u-116MB-mod
+          path: openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64/bin/targets/ramips/mt7621/*sysupgrade.bin
